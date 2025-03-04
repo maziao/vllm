@@ -215,6 +215,8 @@ class EngineArgs:
     additional_config: Optional[Dict[str, Any]] = None
     enable_reasoning: Optional[bool] = None
     reasoning_parser: Optional[str] = None
+    
+    trigger_config: Optional[Dict] = None
 
     def __post_init__(self):
         if not self.tokenizer:

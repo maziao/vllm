@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 import copy
 import time
+import math
 from collections import Counter as collectionsCounter
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import (TYPE_CHECKING, Callable, ClassVar, Deque, Dict, Iterable,
-                    List, Mapping, NamedTuple, Optional)
+                    List, Mapping, NamedTuple, Optional, Any)
 from typing import Sequence as GenericSequence
 from typing import Set, Type, Union, cast, overload
 
@@ -21,6 +23,7 @@ from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          VllmConfig)
 from vllm.core.scheduler import ScheduledSequenceGroup, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.concurrent_task_manager import ConcurrentTaskManager
 from vllm.engine.metrics_types import StatLoggerBase, Stats
 from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
@@ -45,7 +48,7 @@ from vllm.outputs import (PoolingRequestOutput, RequestOutput,
 from vllm.pooling_params import PoolingParams
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.sequence import (ExecuteModelRequest, ParallelSampleSequenceGroup,
+from vllm.sequence import (ExecuteModelRequest, Logprob, ParallelSampleSequenceGroup,
                            PoolingSequenceGroupOutput, Sequence, SequenceGroup,
                            SequenceGroupBase, SequenceGroupMetadata,
                            SequenceGroupOutput, SequenceStatus)
@@ -118,6 +121,14 @@ class SchedulerContext:
                        is_last_step=is_last_step,
                        is_first_step_output=is_first_step_output,
                        skip=[]))
+
+
+@dataclass
+class Trigger:
+    trigger_type: str
+    content: Any
+    trigger_func: Callable
+    timeout: int
 
 
 class LLMEngine:
@@ -215,6 +226,7 @@ class LLMEngine:
         input_registry: InputRegistry = INPUT_REGISTRY,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         use_cached_outputs: bool = False,
+        trigger_config: Optional[Dict] = None,
     ) -> None:
 
         self.vllm_config = vllm_config
@@ -415,6 +427,80 @@ class LLMEngine:
         # the next step without re-scheduling.
         self._skip_scheduling_next_step = False
 
+        """token_trigger_config:
+        {
+            'triggers': [
+                {
+                    'type': 'tokens' | 'text' | 'regex',
+                    'content': Any,
+                    'trigger_func': Callable,
+                    'timeout': int,
+                },
+                ...
+            ],
+            'max_concurrent_triggers': int,
+            'default_timeout': int
+        }
+        """
+        self.tokens_triggers_tree = {}
+        self.text_triggers = {}
+        self.regex_triggers = {}
+        if trigger_config is not None:
+            for trigger in trigger_config['triggers']:
+                if trigger['type'] == 'tokens':
+                    content = trigger['content']
+                    assert isinstance(content, tuple) and len(content) > 0 and all([isinstance(token, int) for token in content])
+                    sub_tree = self.tokens_triggers_tree
+                    for token in reversed(content[1:]):
+                        if token not in sub_tree:
+                            sub_tree[token] = {}
+                        sub_tree = sub_tree[token]
+                    assert content[0] not in sub_tree, f"common suffix in tokens_triggers is prohibited"
+                    sub_tree[content[0]] = Trigger(
+                        trigger_type=trigger['type'],
+                        content=trigger['content'],
+                        trigger_func=trigger['trigger_func'],
+                        timeout=trigger['timeout']
+                    )
+                elif trigger['type'] == 'text':
+                    assert isinstance(trigger['content'], str)
+                    self.text_triggers[trigger['content']] = Trigger(
+                        trigger_type=trigger['type'],
+                        content=trigger['content'],
+                        trigger_func=trigger['trigger_func'],
+                        timeout=trigger['timeout']
+                    )
+                elif trigger['type'] == 'regex':
+                    assert isinstance(trigger['content'], str)
+                    self.regex_triggers[trigger['content']] = Trigger(
+                        trigger_type=trigger['type'],
+                        content=trigger['content'],
+                        trigger_func=trigger['trigger_func'],
+                        timeout=trigger['timeout']
+                    )
+        
+        logger.info(f"trigger_config:")
+        logger.info(f"  - tokens_triggers: {self.tokens_triggers_tree}")
+        logger.info(f"  - text_triggers: {self.text_triggers}")
+        logger.info(f"  - regex_triggers: {self.regex_triggers}")
+        
+        """trigger_result_cache:
+        {
+            trigger_task_id (str): {
+                'tokens_to_append': deque(),
+                'text_or_regex_start_index': int = 0
+            }
+        }
+        """
+        self.trigger_result_cache = {}
+        if trigger_config is not None:
+            self.async_trigger_manager = ConcurrentTaskManager(
+                max_concurrent_tasks=trigger_config['max_concurrent_triggers'],
+                max_processes=trigger_config['max_concurrent_triggers'],
+                default_timeout=trigger_config['default_timeout'],
+                throughput_interval=60
+            )
+
     def _initialize_kv_caches(self) -> None:
         """Initialize the KV cache in the worker(s).
 
@@ -497,6 +583,7 @@ class LLMEngine:
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            trigger_config=engine_args.trigger_config,
         )
 
         return engine
@@ -1232,8 +1319,83 @@ class LLMEngine:
             zip(seq_group_metadata_list, output, scheduled_seq_groups):
             seq_group = scheduled_seq_group.seq_group
 
+            assert len(seq_group_metadata.seq_data.keys()) == 1, f"{seq_group_metadata.seq_data.keys()}"
+            seq_data_index = list(seq_group_metadata.seq_data.keys())[0]
+            seq_data = seq_group_metadata.seq_data[seq_data_index]
+            output_text = seq_group.seqs[0].output_text
+            maybe_trigger_task_id = f"{seq_group_metadata.request_id}--{seq_data_index}"
+            
             if seq_group.is_finished():
+                self.trigger_result_cache.pop(maybe_trigger_task_id, None)
                 continue
+            
+            triggered = False
+            trigger_obj: Trigger = None
+            # if the suffix is in the tokens triggers, or the text or regex appeared in the valid output part,
+            # mark the current status as triggered.
+            sub_tree = self.tokens_triggers_tree
+            for token_id in reversed(seq_data.output_token_ids):
+                if token_id in sub_tree:
+                    sub_tree = sub_tree[token_id]
+                    if isinstance(sub_tree, Trigger):
+                        triggered = True
+                        trigger_obj = sub_tree
+                        break
+                else:
+                    break
+            
+            start_index = 0
+            if not triggered:
+                if maybe_trigger_task_id in self.trigger_result_cache:
+                    start_index = self.trigger_result_cache[maybe_trigger_task_id]['text_or_regex_start_index']
+
+                unchecked_output_text = output_text[start_index:]
+
+                # text or regex triggers
+                for text, trigger in self.text_triggers.items():
+                    index = unchecked_output_text.find(text)
+                    if index >= 0:
+                        triggered = True
+                        trigger_obj = trigger
+                        start_index += index + len(text)
+                        break
+                
+                if not triggered:
+                    for regex, trigger in self.regex_triggers.items():
+                        search_result = re.search(regex, unchecked_output_text, re.DOTALL)
+                        if search_result is not None:
+                            triggered = True
+                            trigger_obj = trigger
+                            start_index += search_result.span()[-1]
+                            break
+            
+            trigger_task_completed = False
+            if triggered:
+                trigger_task_result = self.async_trigger_manager.get_task_result(task_id=maybe_trigger_task_id)
+                if trigger_task_result['status'] == 'not found':
+                    self.async_trigger_manager.add_task(
+                        task_id=maybe_trigger_task_id,
+                        task_fn=trigger_obj['trigger_func'],
+                        timeout=trigger_obj['timeout'],
+                        output_token_ids=seq_data.output_token_ids,
+                        output_text=unchecked_output_text,
+                    )
+                elif trigger_task_result['status'] == 'completed':
+                    trigger_task_completed = True
+                    if len(trigger_task_result['result']) > 0:
+                        # TODO: check the imported tokens are not triggers
+                        self.trigger_result_cache[maybe_trigger_task_id] = {
+                            'tokens_to_append': deque(trigger_task_result["result"]),
+                            'text_or_regex_start_index': start_index
+                        }
+                elif trigger_task_result['status'] in ['error', 'canceled', 'timeout', 'unknown']:
+                    trigger_task_completed = True
+                    self.trigger_result_cache[maybe_trigger_task_id] = {
+                        'tokens_to_append': None,
+                        'text_or_regex_start_index': start_index
+                    }
+                else: # pending, running
+                    pass
 
             if self.scheduler_config.is_multi_step:
                 # Updates happen only if the sequence is prefill
@@ -1241,10 +1403,11 @@ class LLMEngine:
                     seq_group, seq_group_metadata,
                     seq_group.state.num_steps == 1)
             else:
-                token_chunk_size = (seq_group_metadata.token_chunk_size
-                                    if seq_group_metadata.token_chunk_size
-                                    is not None else 0)
-                seq_group.update_num_computed_tokens(token_chunk_size)
+                if (not triggered) or trigger_task_completed:
+                    token_chunk_size = (seq_group_metadata.token_chunk_size
+                                        if seq_group_metadata.token_chunk_size
+                                        is not None else 0)
+                    seq_group.update_num_computed_tokens(token_chunk_size)
 
             if seq_group_metadata.do_sample:
                 assert len(sequence_group_outputs.samples) == 1, (
@@ -1262,7 +1425,18 @@ class LLMEngine:
                     if not is_prefill_append:
                         seq_group.update_num_computed_tokens(1)
                 else:
-                    seq.append_token_id(sample.output_token, sample.logprobs)
+                    if (not triggered) or trigger_task_completed:
+                        if maybe_trigger_task_id in self.trigger_result_cache and self.trigger_result_cache[maybe_trigger_task_id]['tokens_to_append'] is not None:
+                            assert len(self.trigger_result_cache[maybe_trigger_task_id]['tokens_to_append']) > 0
+                            output_token_to_append = self.trigger_result_cache[maybe_trigger_task_id]['tokens_to_append'].popleft()
+                            
+                            # remove the trigger task result deque from the cache if it is empty
+                            if len(self.trigger_result_cache[maybe_trigger_task_id]['tokens_to_append']) == 0:
+                                self.trigger_result_cache[maybe_trigger_task_id]['tokens_to_append'] = None
+                            
+                            seq.append_token_id(output_token_to_append, {output_token_to_append: Logprob(math.inf)})
+                        else:
+                            seq.append_token_id(sample.output_token, sample.logprobs)
 
     def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
         """Performs one decoding iteration and returns newly generated results.

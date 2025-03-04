@@ -654,6 +654,7 @@ class AsyncLLMEngine(EngineClient):
             start_engine_loop=start_engine_loop,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            trigger_config=engine_args.trigger_config,
         )
         return engine
 
