@@ -25,8 +25,9 @@ from enum import Enum
 import multiprocessing
 from dataclasses import dataclass, field
 from typing import Any, Optional, Callable, Tuple, Dict
+from vllm.utils import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class TaskStatus(Enum):
